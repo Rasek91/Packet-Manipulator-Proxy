@@ -1,10 +1,10 @@
 # Packet-Manipulator-Proxy
 
-A proxy to manipulate egrees packets, uses iptables *REDIRECT*.
+A proxy to manipulate egress packets, uses iptables *REDIRECT*.
 
 ## Usage
 
-1. Add a redirect rule to your iptable chains:
+1. Add a redirect rule to your iptables chains:
 
 ```
 iptables -t nat -I OUTPUT -p tcp -m owner --uid-owner test -j REDIRECT --to-ports 7777
@@ -25,9 +25,10 @@ go run .
 sudo -u test curl -4 -k --http1.1 https://172.217.19.110
 ```
 
-## Curent fetuares: **v0.1.0**
+## Current features: **v0.2.0**
 
 - Print the received message with Debug loglevel to the screen
 - IPv4 and IPv6 support
 - TCP and UDP support
 - TLS interception with self-signed certification for localhost IP addresses
+- DTLS interception with self-signed certification for localhost IP addresses

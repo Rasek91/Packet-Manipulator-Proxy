@@ -1,4 +1,4 @@
-package main
+package proxies
 
 import (
 	"fmt"
@@ -34,8 +34,11 @@ func read_and_delete_data(ip_tuple *conntrack.IPTuple) (data []byte) {
 	data_lock.Lock()
 	defer data_lock.Unlock()
 	data = to_destination[ip_tuple]
-	delete(to_destination, ip_tuple)
-	log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "data": string(data)}).Trace("read and delete data")
+
+	if data != nil {
+		delete(to_destination, ip_tuple)
+		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "data": string(data)}).Trace("read and delete data")
+	}
 
 	return
 }
@@ -101,9 +104,21 @@ func create_socket(ip_tuple *conntrack.IPTuple) (net.Conn, error) {
 		}
 	} else if *ip_tuple.Proto.Number == uint8(17) {
 		if ip_tuple.Dst.To4() != nil {
-			return net.Dial("udp", fmt.Sprintf("%v:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
+			connection, error := net.Dial("udp", fmt.Sprintf("%v:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
+
+			if error != nil {
+				return connection, error
+			} else {
+				return create_conn(connection), error
+			}
 		} else {
-			return net.Dial("udp", fmt.Sprintf("[%v]:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
+			connection, error := net.Dial("udp", fmt.Sprintf("[%v]:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
+
+			if error != nil {
+				return connection, error
+			} else {
+				return create_conn(connection), error
+			}
 		}
 	}
 
@@ -116,11 +131,15 @@ func write_data_to_original_destination(socket *Socket, data Data) {
 		error := add_tls_to_socket(data.Ip_tuple)
 
 		if error != nil {
-			log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(data.Ip_tuple)}).Warn("Error add TLS ", error)
+			log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(data.Ip_tuple)}).Warn("Error add TLS write ", error)
 			return
 		}
 
 		socket = read_socket(data.Ip_tuple)
+
+		if *data.Ip_tuple.Proto.Number == uint8(17) {
+			go read_data_from_original_destination(socket, data.Ip_tuple)
+		}
 	}
 
 	socket.Lock.Lock()
@@ -146,17 +165,16 @@ func read_data_from_original_destination(socket *Socket, original_ip_tuple *conn
 			break
 		} else {
 			if socket_now.TLS && !socket.TLS {
-				error := add_tls_to_socket(original_ip_tuple)
-
-				if error != nil {
-					log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple)}).Warn("Error add TLS ", error)
-					break
-				}
-
-				socket = read_socket(original_ip_tuple)
+				socket = socket_now
 			}
 
-			socket.Connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			error := socket.Connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+
+			if error != nil {
+				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple)}).Error("Error set read deadline ", error, socket_now.Connection)
+				break
+			}
+
 			length, error := socket.Connection.Read(buffer)
 			socket.Lock.Unlock()
 
@@ -179,7 +197,7 @@ func read_data_from_original_destination(socket *Socket, original_ip_tuple *conn
 	}
 }
 
-func copy_data_to_original_detination() {
+func Copy_data_to_original_destination() {
 	for {
 		select {
 		case data_with_destination := <-to_original:
@@ -196,6 +214,7 @@ func copy_data_to_original_detination() {
 
 				add_socket(data_with_destination.Ip_tuple, connection, data_with_destination.TLS)
 				socket = read_socket(data_with_destination.Ip_tuple)
+
 				go read_data_from_original_destination(socket, data_with_destination.Ip_tuple)
 			}
 

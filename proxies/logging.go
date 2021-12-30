@@ -1,4 +1,4 @@
-package main
+package proxies
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func setup_log() {
+func Setup_log() {
 	/*file, error := os.OpenFile("testlogrus.log", os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 
 	if error != nil {

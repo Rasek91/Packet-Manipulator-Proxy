@@ -1,4 +1,4 @@
-package main
+package proxies
 
 import (
 	"errors"
@@ -62,10 +62,10 @@ func get_original_ip_tuple(connection_tracker *conntrack.Nfct, raw_connection ne
 		}
 	} else {
 		protocol_number = 17
-		connection := raw_connection.(*net.UDPConn)
+		//connection := raw_connection.(*udp.Conn)
 		source_ip = udp_address.IP
 		source_port = uint16(udp_address.Port)
-		connection_file, error := connection.File()
+		/*connection_file, error := connection.File()
 
 		if error != nil {
 			log.Error("File error ", error)
@@ -92,7 +92,9 @@ func get_original_ip_tuple(connection_tracker *conntrack.Nfct, raw_connection ne
 
 			destination_ip = net.ParseIP(fmt.Sprintf("%d.%d.%d.%d", address.Multiaddr[4], address.Multiaddr[5], address.Multiaddr[6], address.Multiaddr[7]))
 			destination_port = uint16(address.Multiaddr[2])<<8 + uint16(address.Multiaddr[3])
-		}
+		}*/
+
+		return get_original_ip_tuple_connection_tracker(connection_tracker, nil, udp_address)
 	}
 
 	return &conntrack.IPTuple{Src: &source_ip, Dst: &destination_ip, Proto: &conntrack.ProtoTuple{Number: &protocol_number, SrcPort: &source_port, DstPort: &destination_port}}, nil
