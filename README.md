@@ -25,7 +25,7 @@ go run .
 sudo -u test curl -4 -k --http1.1 https://172.217.19.110
 ```
 
-## Current features: **v0.2.0**
+## Current features: **v0.2.1**
 
 - Print the received message with Debug loglevel to the screen
 - IPv4 and IPv6 support
