@@ -1,184 +1,217 @@
 package proxies
 
 import (
+	"context"
+	"crypto/tls"
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/Rasek91/Packet-Manipulator-Proxy/logging"
 	"github.com/Rasek91/hybrid_tcp_tls_conn"
 	"github.com/Rasek91/hybrid_udp_dtls_conn"
-	"github.com/pion/udp"
+	"github.com/Rasek91/udp"
+	"github.com/pion/dtls"
 
 	conntrack "github.com/florianl/go-conntrack"
-	log "github.com/sirupsen/logrus"
 )
 
-type hybrid_conn interface {
-	Read(b []byte) (n int, err error)
+func readRoutine(ctx context.Context, connection net.Conn, buffer []byte, channelInt chan int, channelError chan error) {
+	defer close(channelInt)
+	defer close(channelError)
 
-	Write(b []byte) (n int, err error)
-
-	Close() error
-
-	LocalAddr() net.Addr
-
-	RemoteAddr() net.Addr
-
-	SetDeadline(t time.Time) error
-
-	SetReadDeadline(t time.Time) error
-
-	SetWriteDeadline(t time.Time) error
-
-	Get_TLS() bool
-}
-
-func read_routine(connection net.Conn, buffer []byte, channel_int chan int, channel_error chan error, sync *bool) {
-	defer close(channel_int)
-	defer close(channel_error)
-
-	for *sync {
-		length, error := connection.Read(buffer)
-		channel_error <- error
-		channel_int <- length
-	}
-}
-
-func write_routine(original_ip_tuple *conntrack.IPTuple, channel_answer chan []byte, sync *bool) {
-	defer close(channel_answer)
-
-	for *sync {
-		answer := read_and_delete_data(original_ip_tuple)
-
-		if answer != nil {
-			channel_answer <- answer
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			length, err := connection.Read(buffer)
+			channelError <- err
+			channelInt <- length
 		}
 	}
 }
 
-func handle_connection(original_ip_tuple *conntrack.IPTuple, connection hybrid_conn) {
+func writeRoutine(ctx context.Context, originalIpTuple *logging.IPTuple, channelAnswer chan []byte, toDestination *DataMap) {
+	defer close(channelAnswer)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			answer := toDestination.readDeleteData(originalIpTuple)
+
+			if answer != nil {
+				channelAnswer <- answer
+			}
+		}
+	}
+}
+
+func handleConnection(ctx context.Context, originalIpTuple *logging.IPTuple, connection hybridConn, toOriginal chan Data, sockets *SocketMap, toDestination *DataMap) {
 	iterations := 0
-	sync := new(bool)
-	*sync = true
-	channel_error := make(chan error)
-	channel_int := make(chan int)
-	channel_answer := make(chan []byte)
+	channelError := make(chan error)
+	channelInt := make(chan int)
+	channelAnswer := make(chan []byte)
 	defer connection.Close()
-	defer delete_socket(original_ip_tuple)
-	to_original <- Data{Ip_tuple: original_ip_tuple, Data: nil, TLS: connection.Get_TLS()}
+	defer sockets.deleteSocket(originalIpTuple)
+	toOriginal <- Data{IPTuple: originalIpTuple, Data: nil, TLS: connection.GetTls()}
 	buffer := make([]byte, 1024*4)
-	go read_routine(connection, buffer, channel_int, channel_error, sync)
-	go write_routine(original_ip_tuple, channel_answer, sync)
+	go readRoutine(ctx, connection, buffer, channelInt, channelError)
+	go writeRoutine(ctx, originalIpTuple, channelAnswer, toDestination)
 
 	for iterations < 60 {
 		select {
-		case error := <-channel_error:
-			length := <-channel_int
+		case err := <-channelError:
+			length := <-channelInt
 
-			if error != nil && error != io.EOF {
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple)}).Error("read error ", error)
+			if err != nil && err != io.EOF {
+				logging.Log("error", map[string]interface{}{"function": "handleConnection", "ipTuple": originalIpTuple}, "Read error ", err)
 			}
 
 			if length != 0 {
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple), "data": string(buffer[:length])}).Debug("handle_connection received from client")
+				logging.Log("debug", map[string]interface{}{"function": "handleConnection", "ipTuple": originalIpTuple, "data": string(buffer[:length])}, "Received from client")
 				iterations = 0
-				to_original <- Data{Ip_tuple: original_ip_tuple, Data: buffer[:length], TLS: connection.Get_TLS()}
+				toOriginal <- Data{IPTuple: originalIpTuple, Data: buffer[:length], TLS: connection.GetTls()}
 			}
 
-			if error == io.EOF {
+			if err == io.EOF {
 				iterations = 60
 			}
-		case answer := <-channel_answer:
-			log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple), "data": string(answer)}).Debug("handle_connection received from server")
+		case answer := <-channelAnswer:
+			logging.Log("debug", map[string]interface{}{"function": "handleConnection", "ipTuple": originalIpTuple, "data": string(answer)}, "Received from server")
 			iterations = 0
 			connection.Write(answer)
 		case <-time.After(500 * time.Millisecond):
 			iterations++
+		case <-ctx.Done():
+			logging.Log("trace", map[string]interface{}{"function": "handleConnection", "ipTuple": originalIpTuple}, "Context canceled")
+			return
 		}
-	}
-
-	*sync = false
-}
-
-func Listen_tcp(ip_address, port string) error {
-	port_int64, _ := strconv.ParseInt(port, 0, 64)
-	port_int := int(port_int64)
-	listener, error := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP(ip_address), Port: port_int})
-
-	if error != nil {
-		log.Error("ListenTCP error ", error)
-		return error
-	}
-
-	connection_tracker, error := conntrack.Open(&conntrack.Config{})
-
-	if error != nil {
-		log.Error("Open error ", error)
-		return error
-	}
-
-	log.Info("listen_tcp ", ip_address)
-	defer connection_tracker.Close()
-	defer log.Info("close TCP ", ip_address)
-	defer listener.Close()
-
-	for {
-		connection_raw, error := listener.Accept()
-
-		if error != nil {
-			log.Error("Accept error ", error)
-			return error
-		}
-
-		connection := hybrid_tcp_tls_conn.Create_Conn(connection_raw, Server_tls_config)
-		original_ip_tuple, error := get_original_ip_tuple(connection_tracker, connection_raw, nil)
-
-		if error != nil {
-			log.Panic("Get original IP tuple error ", error)
-		}
-
-		go handle_connection(original_ip_tuple, connection)
 	}
 }
 
-func Listen_udp(ip_address, port string) error {
-	port_int64, _ := strconv.ParseInt(port, 0, 64)
-	port_int := int(port_int64)
-	listener, error := udp.Listen("udp", &net.UDPAddr{IP: net.ParseIP(ip_address), Port: port_int})
+func ListenTcp(ctx context.Context, waitgroup *sync.WaitGroup, ipAddress, port string, toOriginal chan Data, sockets *SocketMap, toDestination *DataMap, tlsConfig *tls.Config) (err error) {
+	defer waitgroup.Done()
+	portInt64, _ := strconv.ParseInt(port, 0, 64)
+	portInt := int(portInt64)
+	listener, errListen := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP(ipAddress), Port: portInt})
 
-	if error != nil {
-		log.Error("ListenUDP error ", error)
-		return error
+	if errListen != nil {
+		logging.Log("error", map[string]interface{}{"function": "ListenTcp"}, "ListenTCP error ", errListen)
+		err = errListen
+		return
 	}
 
-	connection_tracker, error := conntrack.Open(&conntrack.Config{})
+	connectionTracker, errConnTrack := conntrack.Open(&conntrack.Config{})
 
-	if error != nil {
-		log.Error("Open error ", error)
-		return error
+	if errConnTrack != nil {
+		logging.Log("error", map[string]interface{}{"function": "ListenTcp"}, "Open error ", errConnTrack)
+		err = errConnTrack
+		return
 	}
 
-	log.Info("listen_udp ", ip_address)
-	defer connection_tracker.Close()
-	defer log.Info("close UDP ", ip_address)
+	logging.Log("info", map[string]interface{}{"function": "ListenTcp"}, "Listen TCP ", ipAddress)
+	defer connectionTracker.Close()
+	defer logging.Log("info", map[string]interface{}{"function": "ListenTcp"}, "Close TCP ", ipAddress)
 	defer listener.Close()
+	connectionChannel := make(chan net.Conn, 1)
+	connectionErr := make(chan error, 1)
 
 	for {
-		connection_raw, error := listener.Accept()
+		go func(connectionChannel chan net.Conn, connectionErr chan error) {
+			connectionRaw, errAccept := listener.Accept()
+			connectionChannel <- connectionRaw
+			connectionErr <- errAccept
+		}(connectionChannel, connectionErr)
 
-		if error != nil {
-			log.Error("Accept error ", error)
-			return error
+		select {
+		case <-ctx.Done():
+			logging.Log("trace", map[string]interface{}{"function": "ListenTcp"}, "Context canceled")
+			return
+		case errAccept := <-connectionErr:
+			connectionRaw := <-connectionChannel
+
+			if errAccept != nil {
+				logging.Log("error", map[string]interface{}{"function": "ListenTcp"}, "Accept error ", errAccept)
+				err = errAccept
+				return
+			}
+
+			connection := hybrid_tcp_tls_conn.New(connectionRaw, tlsConfig)
+			originalIpTuple, errGetIpTuple := getOriginalIpTuple(connectionTracker, connectionRaw.(*net.TCPConn))
+
+			if errGetIpTuple != nil {
+				logging.Log("panic", map[string]interface{}{"function": "ListenTcp"}, "Get original IP tuple error ", errGetIpTuple)
+				err = errGetIpTuple
+				return
+			}
+
+			go handleConnection(ctx, originalIpTuple, connection, toOriginal, sockets, toDestination)
 		}
+	}
+}
 
-		connection := hybrid_udp_dtls_conn.Create_Conn(connection_raw, Server_dtls_config)
-		original_ip_tuple, error := get_original_ip_tuple(connection_tracker, connection_raw, connection_raw.RemoteAddr().(*net.UDPAddr))
+func ListenUdp(ctx context.Context, waitgroup *sync.WaitGroup, ipAddress, port string, toOriginal chan Data, sockets *SocketMap, toDestination *DataMap, dtlsConfig *dtls.Config) (err error) {
+	defer waitgroup.Done()
+	portInt64, _ := strconv.ParseInt(port, 0, 64)
+	portInt := int(portInt64)
+	listener, errListen := udp.Listen("udp", &net.UDPAddr{IP: net.ParseIP(ipAddress), Port: portInt})
 
-		if error != nil {
-			log.Panic("Get original IP tuple error ", error)
+	if errListen != nil {
+		logging.Log("error", map[string]interface{}{"function": "ListenUdp"}, "ListenUDP error ", errListen)
+		err = errListen
+		return
+	}
+
+	connectionTracker, errConnTrack := conntrack.Open(&conntrack.Config{})
+
+	if errConnTrack != nil {
+		logging.Log("error", map[string]interface{}{"function": "ListenUdp"}, "Open error ", errConnTrack)
+		err = errConnTrack
+		return
+	}
+
+	logging.Log("info", map[string]interface{}{"function": "ListenUdp"}, "Listen UDP ", ipAddress)
+	defer connectionTracker.Close()
+	defer logging.Log("info", map[string]interface{}{"function": "ListenUdp"}, "Close UDP ", ipAddress)
+	//defer listener.Close() blocking forever
+	connectionChannel := make(chan net.Conn, 1)
+	connectionErr := make(chan error, 1)
+
+	for {
+		go func(connectionChannel chan net.Conn, connectionErr chan error) {
+			connectionRaw, errAccept := listener.Accept()
+			connectionChannel <- connectionRaw
+			connectionErr <- errAccept
+		}(connectionChannel, connectionErr)
+
+		select {
+		case <-ctx.Done():
+			logging.Log("trace", map[string]interface{}{"function": "ListenUdp"}, "Context canceled")
+			return
+		case errAccept := <-connectionErr:
+			connectionRaw := <-connectionChannel
+
+			if errAccept != nil {
+				logging.Log("error", map[string]interface{}{"function": "ListenUdp"}, "Accept error ", errAccept)
+				err = errAccept
+				return
+			}
+
+			connection := hybrid_udp_dtls_conn.New(connectionRaw, dtlsConfig)
+			originalIpTuple, errGetIpTuple := getOriginalIpTuple(connectionTracker, connectionRaw.(*udp.Conn))
+
+			if errGetIpTuple != nil {
+				logging.Log("panic", map[string]interface{}{"function": "ListenUdp"}, "Get original IP tuple error ", errGetIpTuple)
+				err = errGetIpTuple
+				return
+			}
+
+			go handleConnection(ctx, originalIpTuple, connection, toOriginal, sockets, toDestination)
 		}
-
-		go handle_connection(original_ip_tuple, connection)
 	}
 }

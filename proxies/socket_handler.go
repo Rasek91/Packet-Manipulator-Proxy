@@ -1,6 +1,8 @@
 package proxies
 
 import (
+	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -8,20 +10,24 @@ import (
 	"sync"
 	"time"
 
-	conntrack "github.com/florianl/go-conntrack"
-	log "github.com/sirupsen/logrus"
+	"github.com/Rasek91/Packet-Manipulator-Proxy/logging"
+	"github.com/pion/dtls"
 )
 
-var to_original = make(chan Data)
-var sockets = make(map[*conntrack.IPTuple]*Socket)
-var data_lock = sync.RWMutex{}
-var socket_lock = sync.RWMutex{}
-var to_destination = make(map[*conntrack.IPTuple][]byte)
+type DataMap struct {
+	Map  map[*logging.IPTuple][]byte
+	Lock *sync.RWMutex
+}
+
+type SocketMap struct {
+	Map  map[*logging.IPTuple]*Socket
+	Lock *sync.RWMutex
+}
 
 type Data struct {
-	Ip_tuple *conntrack.IPTuple
-	Data     []byte
-	TLS      bool
+	IPTuple *logging.IPTuple
+	Data    []byte
+	TLS     bool
 }
 
 type Socket struct {
@@ -30,197 +36,254 @@ type Socket struct {
 	TLS        bool
 }
 
-func read_and_delete_data(ip_tuple *conntrack.IPTuple) (data []byte) {
-	data_lock.Lock()
-	defer data_lock.Unlock()
-	data = to_destination[ip_tuple]
+func Setup() (toOriginal chan Data, sockets SocketMap, toDestination DataMap, tlsConfig *tls.Config, dtlsConfig *dtls.Config, err error) {
+	sockets = SocketMap{Map: make(map[*logging.IPTuple]*Socket), Lock: &sync.RWMutex{}}
+	toDestination = DataMap{Map: make(map[*logging.IPTuple][]byte), Lock: &sync.RWMutex{}}
+	toOriginal = make(chan Data)
+
+	caCert, caPrivateKey, errCa := CaCertSetup()
+
+	if errCa != nil {
+		err = errCa
+		logging.Log("error", map[string]interface{}{"function": "Setup"}, "CA certificate error ", errCa)
+		return
+	}
+
+	tlsConfig, errTls := TlsConfigSetup(caCert, caPrivateKey)
+
+	if errTls != nil {
+		err = errTls
+		return
+	}
+
+	dtlsConfig, errDtls := DtlsConfigSetup(caCert, caPrivateKey)
+
+	if errDtls != nil {
+		err = errDtls
+		return
+	}
+
+	logging.Log("trace", map[string]interface{}{"function": "Setup"}, "Proxies set up")
+	return
+}
+
+func (dataMap *DataMap) readDeleteData(ipTuple *logging.IPTuple) (data []byte) {
+	dataMap.Lock.Lock()
+	defer dataMap.Lock.Unlock()
+	data = dataMap.Map[ipTuple]
 
 	if data != nil {
-		delete(to_destination, ip_tuple)
-		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "data": string(data)}).Trace("read and delete data")
+		delete(dataMap.Map, ipTuple)
+		logging.Log("trace", map[string]interface{}{"function": "readDeleteData", "ipTuple": ipTuple, "data": string(data)}, "Read and delete data")
 	}
 
 	return
 }
 
-func add_data(ip_tuple *conntrack.IPTuple, data []byte) {
-	data_lock.Lock()
-	defer data_lock.Unlock()
+func (dataMap *DataMap) addData(ipTuple *logging.IPTuple, data []byte) {
+	dataMap.Lock.Lock()
+	defer dataMap.Lock.Unlock()
 
-	if to_destination[ip_tuple] != nil {
-		original_data := to_destination[ip_tuple]
-		buffer := append(original_data, data...)
-		to_destination[ip_tuple] = buffer
-		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "data": string(buffer)}).Trace("data append to")
+	if dataMap.Map[ipTuple] != nil {
+		originalData := dataMap.Map[ipTuple]
+		buffer := append(originalData, data...)
+		dataMap.Map[ipTuple] = buffer
+		logging.Log("trace", map[string]interface{}{"function": "addData", "ipTuple": ipTuple, "data": string(buffer)}, "Data appended")
 	} else {
 		buffer := make([]byte, len(data))
 		copy(buffer, data)
-		to_destination[ip_tuple] = buffer
-		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "data": string(buffer)}).Trace("data added")
+		dataMap.Map[ipTuple] = buffer
+		logging.Log("trace", map[string]interface{}{"function": "addData", "ipTuple": ipTuple, "data": string(buffer)}, "Data added")
 	}
 }
 
-func add_socket(ip_tuple *conntrack.IPTuple, socket net.Conn, tls bool) {
-	socket_lock.Lock()
-	defer socket_lock.Unlock()
-	original_socket, in := sockets[ip_tuple]
+func (socket *SocketMap) addSocket(ipTuple *logging.IPTuple, connection net.Conn, tls bool) {
+	socket.Lock.Lock()
+	defer socket.Lock.Unlock()
+	originalSocket, in := socket.Map[ipTuple]
 
 	if in {
-		sockets[ip_tuple] = &Socket{Connection: socket, Lock: original_socket.Lock, TLS: tls}
+		socket.Map[ipTuple] = &Socket{Connection: connection, Lock: originalSocket.Lock, TLS: tls}
 	} else {
-		sockets[ip_tuple] = &Socket{Connection: socket, Lock: &sync.RWMutex{}, TLS: tls}
+		socket.Map[ipTuple] = &Socket{Connection: connection, Lock: &sync.RWMutex{}, TLS: tls}
 	}
 
-	log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "socket": sockets[ip_tuple]}).Trace("add socket")
+	logging.Log("trace", map[string]interface{}{"function": "addSocket", "ipTuple": ipTuple, "socket": socket.Map[ipTuple]}, "Add socket")
 }
 
-func read_socket(ip_tuple *conntrack.IPTuple) (socket *Socket) {
-	socket_lock.RLock()
-	defer socket_lock.RUnlock()
-	socket = sockets[ip_tuple]
-
+func (socket *SocketMap) readSocket(ipTuple *logging.IPTuple) (connection *Socket) {
+	socket.Lock.RLock()
+	defer socket.Lock.RUnlock()
+	connection = socket.Map[ipTuple]
+	logging.Log("trace", map[string]interface{}{"function": "readSocket", "ipTuple": ipTuple, "socket": socket.Map[ipTuple]}, "Read socket")
 	return
 }
 
-func delete_socket(ip_tuple *conntrack.IPTuple) {
-	socket_lock.Lock()
-	defer socket_lock.Unlock()
+func (socket *SocketMap) deleteSocket(ipTuple *logging.IPTuple) {
+	socket.Lock.Lock()
+	defer socket.Lock.Unlock()
 
-	if sockets[ip_tuple] != nil {
-		socket := sockets[ip_tuple]
-		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "socket": sockets[ip_tuple]}).Trace("delete socket")
-		delete(sockets, ip_tuple)
-		log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple), "socket": sockets[ip_tuple]}).Trace("close socket")
-		socket.Connection.Close()
+	if socket.Map[ipTuple] != nil {
+		connection := socket.Map[ipTuple]
+		logging.Log("trace", map[string]interface{}{"function": "deleteSocket", "ipTuple": ipTuple, "socket": socket.Map[ipTuple]}, "Delete socket")
+		delete(socket.Map, ipTuple)
+		logging.Log("trace", map[string]interface{}{"function": "deleteSocket", "ipTuple": ipTuple, "socket": socket.Map[ipTuple]}, "Close socket")
+		connection.Connection.Close()
 	}
 }
 
-func create_socket(ip_tuple *conntrack.IPTuple) (net.Conn, error) {
-	if *ip_tuple.Proto.Number == uint8(6) {
-		if ip_tuple.Dst.To4() != nil {
-			return net.Dial("tcp", fmt.Sprintf("%v:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
+func createSocket(ipTuple *logging.IPTuple) (socket net.Conn, err error) {
+	if *ipTuple.Proto.Number == uint8(6) {
+		if ipTuple.Dst.To4() != nil {
+			socket, err = net.Dial("tcp", fmt.Sprintf("%v:%d", ipTuple.Dst.String(), *ipTuple.Proto.DstPort))
+			logging.Log("trace", map[string]interface{}{"function": "createSocket", "ipTuple": ipTuple, "socket": socket}, "Create IPv4 TCP socket")
+			return
 		} else {
-			return net.Dial("tcp", fmt.Sprintf("[%v]:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
-		}
-	} else if *ip_tuple.Proto.Number == uint8(17) {
-		if ip_tuple.Dst.To4() != nil {
-			connection, error := net.Dial("udp", fmt.Sprintf("%v:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
-
-			if error != nil {
-				return connection, error
-			} else {
-				return create_conn(connection), error
-			}
-		} else {
-			connection, error := net.Dial("udp", fmt.Sprintf("[%v]:%d", ip_tuple.Dst.String(), *ip_tuple.Proto.DstPort))
-
-			if error != nil {
-				return connection, error
-			} else {
-				return create_conn(connection), error
-			}
-		}
-	}
-
-	log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(ip_tuple)}).Fatal("Ip protocol number not recognized ", *ip_tuple.Proto.Number)
-	return nil, nil
-}
-
-func write_data_to_original_destination(socket *Socket, data Data) {
-	if data.TLS && !socket.TLS {
-		error := add_tls_to_socket(data.Ip_tuple)
-
-		if error != nil {
-			log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(data.Ip_tuple)}).Warn("Error add TLS write ", error)
+			socket, err = net.Dial("tcp", fmt.Sprintf("[%v]:%d", ipTuple.Dst.String(), *ipTuple.Proto.DstPort))
+			logging.Log("trace", map[string]interface{}{"function": "createSocket", "ipTuple": ipTuple, "socket": socket}, "Create IPv6 TCP socket")
 			return
 		}
+	} else if *ipTuple.Proto.Number == uint8(17) {
+		if ipTuple.Dst.To4() != nil {
+			connection, errDial := net.Dial("udp", fmt.Sprintf("%v:%d", ipTuple.Dst.String(), *ipTuple.Proto.DstPort))
 
-		socket = read_socket(data.Ip_tuple)
+			if errDial != nil {
+				socket, err = connection, errDial
+				return
+			} else {
+				socket = New(connection)
+				logging.Log("trace", map[string]interface{}{"function": "createSocket", "ipTuple": ipTuple, "socket": socket}, "Create IPv4 UDP socket")
+				return
+			}
+		} else {
+			connection, errDial := net.Dial("udp", fmt.Sprintf("[%v]:%d", ipTuple.Dst.String(), *ipTuple.Proto.DstPort))
 
-		if *data.Ip_tuple.Proto.Number == uint8(17) {
-			go read_data_from_original_destination(socket, data.Ip_tuple)
+			if errDial != nil {
+				socket, err = connection, errDial
+				return
+			} else {
+				socket = New(connection)
+				logging.Log("trace", map[string]interface{}{"function": "createSocket", "ipTuple": ipTuple, "socket": socket}, "Create IPv6 UDP socket")
+				return
+			}
+		}
+	}
+
+	logging.Log("fatal", map[string]interface{}{"function": "createSocket", "ipTuple": ipTuple}, "Ip protocol number not recognized ", *ipTuple.Proto.Number)
+	return
+}
+
+func writeDataOriginalDestination(ctx context.Context, socket *Socket, data Data, sockets *SocketMap, toDestination *DataMap) {
+	select {
+	case <-ctx.Done():
+		logging.Log("trace", map[string]interface{}{"function": "writeDataOriginalDestination"}, "Context canceled")
+		return
+	default:
+		if data.TLS && !socket.TLS {
+			errAddTls := addTlsSocket(data.IPTuple, sockets)
+
+			if errAddTls != nil {
+				logging.Log("warning", map[string]interface{}{"function": "writeDataOriginalDestination", "ipTuple": data.IPTuple}, "Error add TLS write ", errAddTls)
+				return
+			}
+
+			socket = sockets.readSocket(data.IPTuple)
+
+			if *data.IPTuple.Proto.Number == uint8(17) {
+				go readDataOriginalDestination(ctx, socket, data.IPTuple, sockets, toDestination)
+			}
 		}
 	}
 
 	socket.Lock.Lock()
-	_, error := socket.Connection.Write(data.Data)
+	_, errWrite := socket.Connection.Write(data.Data)
 	socket.Lock.Unlock()
 
-	if error != nil {
-		log.WithFields(log.Fields{"socket": socket}).Error("error write to original destination ", error)
+	if errWrite != nil {
+		logging.Log("error", map[string]interface{}{"function": "writeDataOriginalDestination", "socket": socket}, "Error write to original destination ", errWrite)
 	}
 
-	log.WithFields(log.Fields{"socket": socket, "data": string(data.Data)}).Trace("write_data_from_original_destination sent to server")
+	logging.Log("trace", map[string]interface{}{"function": "writeDataOriginalDestination", "socket": socket, "data": string(data.Data)}, "Sent to server")
 }
 
-func read_data_from_original_destination(socket *Socket, original_ip_tuple *conntrack.IPTuple) {
-	defer delete_socket(original_ip_tuple)
+func readDataOriginalDestination(ctx context.Context, socket *Socket, originalIpTuple *logging.IPTuple, sockets *SocketMap, toDestination *DataMap) {
+	defer sockets.deleteSocket(originalIpTuple)
 	buffer := make([]byte, 1024*4)
 
 	for {
-		socket.Lock.Lock()
-		socket_now := read_socket(original_ip_tuple)
+		select {
+		case <-ctx.Done():
+			logging.Log("trace", map[string]interface{}{"function": "readDataOriginalDestination"}, "Context canceled")
+			return
+		default:
+			socket.Lock.Lock()
+			socketNow := sockets.readSocket(originalIpTuple)
 
-		if socket_now == nil {
-			break
-		} else {
-			if socket_now.TLS && !socket.TLS {
-				socket = socket_now
+			if socketNow == nil {
+				return
+			} else {
+				if socketNow.TLS && !socket.TLS {
+					socket = socketNow
+				}
+
+				errSetDeadLine := socket.Connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+
+				if errSetDeadLine != nil {
+					logging.Log("error", map[string]interface{}{"function": "readDataOriginalDestination", "ipTuple": originalIpTuple, "socket": socket}, "Error set read deadline ", errSetDeadLine)
+					return
+				}
+
+				length, errRead := socket.Connection.Read(buffer)
+				socket.Lock.Unlock()
+
+				if errRead != nil && errRead != io.EOF && !os.IsTimeout(errRead) {
+					logging.Log("error", map[string]interface{}{"function": "readDataOriginalDestination", "ipTuple": originalIpTuple, "socket": socket}, "Error read data ", errRead)
+					return
+				}
+
+				if length != 0 {
+					logging.Log("trace", map[string]interface{}{"function": "readDataOriginalDestination", "ipTuple": originalIpTuple, "socket": socket, "data": string(buffer[:length])}, "Received from server")
+					toDestination.addData(originalIpTuple, buffer[:length])
+				}
+
+				if errRead == io.EOF {
+					return
+				}
+
+				time.Sleep(100 * time.Millisecond)
 			}
-
-			error := socket.Connection.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-
-			if error != nil {
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple)}).Error("Error set read deadline ", error, socket_now.Connection)
-				break
-			}
-
-			length, error := socket.Connection.Read(buffer)
-			socket.Lock.Unlock()
-
-			if error != nil && error != io.EOF && !os.IsTimeout(error) {
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple)}).Warn("Error read data ", error, socket_now.Connection)
-				break
-			}
-
-			if length != 0 {
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(original_ip_tuple), "data": string(buffer[:length])}).Trace("read_data_from_original_destination received from server")
-				add_data(original_ip_tuple, buffer[:length])
-			}
-
-			if error == io.EOF {
-				break
-			}
-
-			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
-func Copy_data_to_original_destination() {
+func CopyDataOriginalDestination(ctx context.Context, waitgroup *sync.WaitGroup, toOriginal chan Data, sockets *SocketMap, toDestination *DataMap) {
+	defer waitgroup.Done()
+
 	for {
 		select {
-		case data_with_destination := <-to_original:
-			socket := read_socket(data_with_destination.Ip_tuple)
+		case dataDestination := <-toOriginal:
+			socket := sockets.readSocket(dataDestination.IPTuple)
 
 			if socket == nil {
-				connection, error := create_socket(data_with_destination.Ip_tuple)
-				log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(data_with_destination.Ip_tuple), "socket": socket}).Trace("create socket")
+				connection, errSocket := createSocket(dataDestination.IPTuple)
 
-				if error != nil {
-					log.WithFields(log.Fields{"ip_tuple": print_ip_tuple(data_with_destination.Ip_tuple), "socket": socket}).Error("Error with socket open ", error)
+				if errSocket != nil {
+					logging.Log("error", map[string]interface{}{"function": "CopyDataOriginalDestination", "ipTuple": dataDestination.IPTuple, "socket": socket}, "Error with socket open ", errSocket)
 					return
 				}
 
-				add_socket(data_with_destination.Ip_tuple, connection, data_with_destination.TLS)
-				socket = read_socket(data_with_destination.Ip_tuple)
+				sockets.addSocket(dataDestination.IPTuple, connection, dataDestination.TLS)
+				socket = sockets.readSocket(dataDestination.IPTuple)
 
-				go read_data_from_original_destination(socket, data_with_destination.Ip_tuple)
+				go readDataOriginalDestination(ctx, socket, dataDestination.IPTuple, sockets, toDestination)
 			}
 
-			if data_with_destination.Data != nil {
-				go write_data_to_original_destination(socket, data_with_destination)
+			if dataDestination.Data != nil {
+				go writeDataOriginalDestination(ctx, socket, dataDestination, sockets, toDestination)
 			}
+		case <-ctx.Done():
+			logging.Log("trace", map[string]interface{}{"function": "CopyDataOriginalDestination"}, "Context canceled")
+			return
 		}
 	}
 }

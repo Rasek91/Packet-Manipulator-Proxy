@@ -1,39 +1,47 @@
 package main
 
 import (
+	"context"
+	"os"
+	"os/signal"
+	"sync"
+
+	"github.com/Rasek91/Packet-Manipulator-Proxy/logging"
 	"github.com/Rasek91/Packet-Manipulator-Proxy/proxies"
-	log "github.com/sirupsen/logrus"
 )
 
 func main() {
-	proxies.Setup_log()
+	waitgroup := sync.WaitGroup{}
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	logging.Setup()
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt)
 
 	config := "proxies"
 
 	if config == "proxies" {
-		proxies.CA_cert, proxies.CA_private_key, proxies.CA_error = proxies.CA_cert_setup()
+		toOriginal, sockets, toDestination, tlsConfig, dtlsConfig, err := proxies.Setup()
 
-		if proxies.CA_error != nil {
-			log.Fatal("CA Cert create error ", proxies.CA_error)
+		if err != nil {
+			return
 		}
 
-		proxies.Server_tls_config, proxies.TLS_error = proxies.TLS_config_setup(proxies.CA_cert, proxies.CA_private_key)
-
-		if proxies.TLS_error != nil {
-			log.Fatal("TLS Cert create error ", proxies.TLS_error)
-		}
-
-		proxies.Server_dtls_config, proxies.DTLS_error = proxies.DTLS_config_setup(proxies.CA_cert, proxies.CA_private_key)
-
-		if proxies.DTLS_error != nil {
-			log.Fatal("DTLS Cert create error ", proxies.DTLS_error)
-		}
-
-		log.Info("Certificate generated")
-		go proxies.Listen_udp("127.0.0.1", "7777")
-		go proxies.Listen_udp("::1", "7777")
-		go proxies.Listen_tcp("127.0.0.1", "7777")
-		go proxies.Listen_tcp("::1", "7777")
-		proxies.Copy_data_to_original_destination()
+		logging.Log("info", map[string]interface{}{"function": "main"}, "Certificate generated")
+		waitgroup.Add(1)
+		go proxies.ListenUdp(ctx, &waitgroup, "127.0.0.1", "7777", toOriginal, &sockets, &toDestination, dtlsConfig)
+		waitgroup.Add(1)
+		go proxies.ListenUdp(ctx, &waitgroup, "::1", "7777", toOriginal, &sockets, &toDestination, dtlsConfig)
+		waitgroup.Add(1)
+		go proxies.ListenTcp(ctx, &waitgroup, "127.0.0.1", "7777", toOriginal, &sockets, &toDestination, tlsConfig)
+		waitgroup.Add(1)
+		go proxies.ListenTcp(ctx, &waitgroup, "::1", "7777", toOriginal, &sockets, &toDestination, tlsConfig)
+		waitgroup.Add(1)
+		go proxies.CopyDataOriginalDestination(ctx, &waitgroup, toOriginal, &sockets, &toDestination)
 	}
+
+	<-signalChannel
+	logging.Log("info", map[string]interface{}{"function": "main"}, "Interupted")
+	cancel()
+	waitgroup.Wait()
 }

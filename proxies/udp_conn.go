@@ -10,78 +10,83 @@ import (
 type Conn struct {
 	connection net.Conn
 	buffer     *packetio.Buffer
-	read_error error
+	readErr    error
 	closed     bool
 }
 
 func (connection *Conn) read() {
 	for !connection.closed {
 		buffer := make([]byte, 1024*4)
-		length, error := connection.connection.Read(buffer)
+		length, err := connection.connection.Read(buffer)
 
-		if error != nil {
-			connection.read_error = error
+		if err != nil {
+			connection.readErr = err
 		} else {
 			connection.buffer.Write(buffer[:length])
 		}
 	}
 }
 
-func (connection *Conn) Read(buffer []byte) (int, error) {
-	length, error := connection.buffer.Read(buffer)
+func (connection *Conn) Read(buffer []byte) (length int, err error) {
+	length, err = connection.buffer.Read(buffer)
 
-	if connection.read_error != nil {
-		return length, connection.read_error
+	if connection.readErr != nil {
+		err = connection.readErr
+		return
 	}
 
-	if error != nil {
-		return length, error
-	}
-
-	return length, error
+	return
 }
 
-func (connection *Conn) Write(buffer []byte) (int, error) {
-	return connection.connection.Write(buffer)
+func (connection *Conn) Write(buffer []byte) (length int, err error) {
+	length, err = connection.connection.Write(buffer)
+	return
 }
 
-func (connection *Conn) Close() error {
+func (connection *Conn) Close() (err error) {
 	connection.closed = true
-	return connection.connection.Close()
+	err = connection.connection.Close()
+	return
 }
 
-func (connection *Conn) LocalAddr() net.Addr {
-	return connection.connection.LocalAddr()
+func (connection *Conn) LocalAddr() (address net.Addr) {
+	address = connection.connection.LocalAddr()
+	return
 }
 
-func (connection *Conn) RemoteAddr() net.Addr {
-	return connection.connection.RemoteAddr()
+func (connection *Conn) RemoteAddr() (address net.Addr) {
+	address = connection.connection.RemoteAddr()
+	return
 }
 
-func (connection *Conn) SetDeadline(time time.Time) error {
-	error_read := connection.buffer.SetReadDeadline(time)
-	error_write := connection.connection.SetWriteDeadline(time)
+func (connection *Conn) SetDeadline(time time.Time) (err error) {
+	errRead := connection.buffer.SetReadDeadline(time)
+	errWrite := connection.connection.SetWriteDeadline(time)
 
-	if error_read != nil {
-		return error_read
-	} else if error_write != nil {
-		return error_write
+	if errRead != nil {
+		err = errRead
+		return
+	} else if errWrite != nil {
+		err = errWrite
+		return
 	}
 
-	return nil
+	return
 }
 
-func (connection *Conn) SetReadDeadline(time time.Time) error {
-	return connection.buffer.SetReadDeadline(time)
+func (connection *Conn) SetReadDeadline(time time.Time) (err error) {
+	err = connection.buffer.SetReadDeadline(time)
+	return
 }
 
-func (connection *Conn) SetWriteDeadline(time time.Time) error {
-	return connection.connection.SetWriteDeadline(time)
+func (connection *Conn) SetWriteDeadline(time time.Time) (err error) {
+	err = connection.connection.SetWriteDeadline(time)
+	return
 }
 
-func create_conn(raw_connection net.Conn) *Conn {
-	connection := &Conn{connection: raw_connection, buffer: packetio.NewBuffer(), closed: false}
+func New(rawConnection net.Conn) (connection *Conn) {
+	connection = &Conn{connection: rawConnection, buffer: packetio.NewBuffer(), closed: false}
 	go connection.read()
 
-	return connection
+	return
 }
